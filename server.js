@@ -14,7 +14,6 @@ app.use(express.json());
 // ✅ allowed origins (ONLY domain, no path)
 const allowedOrigins = [
   "https://demo.digeesell.ae",
-  "https://landing-enroll.onrender.com", // ✅ frontend url bhi add
   "http://localhost:5173",
   "http://localhost:5174",
 ];
