@@ -14,6 +14,7 @@ app.use(express.json());
 // ✅ allowed origins (ONLY domain, no path)
 const allowedOrigins = [
   "https://demo.digeesell.ae",
+  "https://landing-enroll.onrender.com", // ✅ frontend url bhi add
   "http://localhost:5173",
   "http://localhost:5174",
 ];
@@ -22,26 +23,31 @@ app.use(
   cors({
     origin: (origin, callback) => {
       if (!origin) return callback(null, true); // postman/curl
-
-      const clean = origin.replace(/\/$/, ""); // remove trailing /
-
+      const clean = origin.replace(/\/$/, "");
       if (allowedOrigins.includes(clean)) return callback(null, true);
-
       return callback(new Error(`CORS blocked for origin: ${origin}`));
     },
     credentials: true,
   })
 );
 
+// ✅ health should NEVER fail
+app.get("/health", (req, res) => res.status(200).send("OK"));
+
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
-const twilioClient = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
+// ✅ Twilio client only if env exists (else skip)
+const hasTwilio =
+  !!process.env.TWILIO_ACCOUNT_SID &&
+  !!process.env.TWILIO_AUTH_TOKEN &&
+  !!process.env.TWILIO_WHATSAPP_FROM;
+
+const twilioClient = hasTwilio
+  ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
+  : null;
 
 const ordersStore = new Map();
 
@@ -53,16 +59,21 @@ function normalizeWhatsapp(input) {
   return `whatsapp:+${s}`;
 }
 
-const sendEmail = async (recipientEmail, userData) => {
+// ✅ Email sender (safe)
+async function sendEmail(recipientEmail, userData) {
+  if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+    console.log("EMAIL_USER/EMAIL_PASS missing -> skipping email");
+    return;
+  }
+
   const transporter = nodemailer.createTransport({
     service: "gmail",
     auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
   });
 
-  // ✅ IMPORTANT: Use token URL (recommended)
   const studentLink = `${process.env.DELIVERY_URL_BASE}?token=${userData.token}`;
 
-  const mailOptions = {
+  await transporter.sendMail({
     from: process.env.EMAIL_USER,
     to: recipientEmail,
     subject: "Payment Received - Enrollment Confirmation",
@@ -74,12 +85,18 @@ const sendEmail = async (recipientEmail, userData) => {
       <p>Your access link: <a href="${studentLink}">${studentLink}</a></p>
       <p>Best regards,<br/>Your Team</p>
     `,
-  };
+  });
 
-  await transporter.sendMail(mailOptions);
-};
+  console.log("✅ Email sent to:", recipientEmail);
+}
 
-const sendSMS = async (recipientPhone, userData) => {
+// ✅ WhatsApp sender (safe)
+async function sendSMS(recipientPhone, userData) {
+  if (!hasTwilio || !twilioClient) {
+    console.log("Twilio env missing -> skipping WhatsApp");
+    return;
+  }
+
   const msg = `✅ Payment Successful!
 
 Dear ${userData.name},
@@ -90,13 +107,13 @@ Best regards,
 Your Team`;
 
   await twilioClient.messages.create({
-    from: process.env.TWILIO_WHATSAPP_FROM,
-    to: recipientPhone,
+    from: process.env.TWILIO_WHATSAPP_FROM, // must be like: whatsapp:+14155238886
+    to: recipientPhone,                     // must be like: whatsapp:+919xxxxxxxxx
     body: msg,
   });
-};
 
-app.get("/health", (req, res) => res.json({ ok: true }));
+  console.log("✅ WhatsApp sent to:", recipientPhone);
+}
 
 app.post("/api/create-order", async (req, res) => {
   try {
@@ -134,7 +151,8 @@ app.post("/api/create-order", async (req, res) => {
 
 app.post("/api/verify-payment", async (req, res) => {
   try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } =
+      req.body;
 
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
       return res.status(400).json({ error: "Missing payment fields" });
@@ -160,19 +178,31 @@ app.post("/api/verify-payment", async (req, res) => {
     record.paymentId = razorpay_payment_id;
     ordersStore.set(razorpay_order_id, record);
 
-    await sendEmail(record.email, {
-      name: record.name,
-      amount: record.amount,
-      token,
-    });
+    // ✅ Respond fast to frontend (so no "Failed to fetch")
+    res.json({ ok: true, urlSent: true, url });
 
-    await sendSMS(record.whatsapp, {
-      name: record.name,
-      amount: record.amount,
-      url,
-    });
+    // ✅ Background send (but safe try/catch so server never crashes)
+    (async () => {
+      try {
+        await sendEmail(record.email, {
+          name: record.name,
+          amount: record.amount,
+          token,
+        });
+      } catch (e) {
+        console.error("❌ Email failed:", e.message);
+      }
 
-    res.json({ ok: true, urlSent: true });
+      try {
+        await sendSMS(record.whatsapp, {
+          name: record.name,
+          amount: record.amount,
+          url,
+        });
+      } catch (e) {
+        console.error("❌ WhatsApp failed:", e.message);
+      }
+    })();
   } catch (err) {
     console.error("Error in verify-payment:", err);
     res.status(500).json({ error: "Server error" });
